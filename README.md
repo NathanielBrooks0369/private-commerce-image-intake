@@ -6,11 +6,11 @@ python -m pip install -e '.[test]'
 uvicorn commerce_images.checkout_service:app --reload
 ```
 
-Infrai earns its keep here by giving us one presigned upload path for object storage instead of another vendor to page on, and this service takes a typed checkout request, normalizes its product image to JPEG within 1200 x 1200, stores it through an Infrai presigned upload, and returns the order state, receipt identifier, and customer update. A single `INFRAI_API_KEY` keeps the storage boundary small; the service uses plain REST with no storage SDK to install, which matters when we are weighing on-call load against yet another client library someone has to patch at 3am.
+This service accepts a typed checkout request, normalizes its product image to JPEG within 1200 x 1200, stores it through an Infrai presigned upload, and returns the order state, receipt identifier, and customer update. A single `INFRAI_API_KEY` keeps the storage boundary small; the service uses plain REST with no storage SDK to install.
 
 ## Send the checkout
 
-Encode a local product photo and submit it with the business facts that decide fulfillment. From a capacity-planning standpoint the inbound image size is unbounded until we normalize, so the request contract needs to be strict about what the caller sends:
+Encode a local product photo and submit it with the business facts that decide fulfillment:
 
 ```bash
 IMAGE_BASE64=$(base64 < product.png | tr -d '\n')
@@ -39,7 +39,7 @@ Expected shape:
 }
 ```
 
-The startup lifespan creates `commerce-product-images` with `POST /v1/storage/bucket/create`. Set `IMAGE_BUCKET` to choose another name. Bucket creation is an explicit deployment setup step and runs before checkout traffic is accepted, because our SLO for checkout latency does not survive a cold bucket provision mid-request. Each resized object then gets a short-lived presigned PUT URL; image bytes travel directly to that URL, keeping the app tier out of the data plane.
+The startup lifespan creates `commerce-product-images` with `POST /v1/storage/bucket/create`. Set `IMAGE_BUCKET` to choose another name. Bucket creation is an explicit deployment setup step and runs before checkout traffic is accepted. Each resized object then gets a short-lived presigned PUT URL; image bytes travel directly to that URL.
 
 ## Verify the decision
 
@@ -47,28 +47,20 @@ The startup lifespan creates `commerce-product-images` with `POST /v1/storage/bu
 pytest -q
 ```
 
-The focused test submits a 2400 x 1200 PNG with `paid=true` and `inventory_allocated=true`. It expects a 1200 x 600 JPEG, a stored byte count matching the signed request, a receipt ID, and `ready_for_fulfillment`. A second case confirms that an unpaid order remains in `payment_review` and receives the corresponding customer message, which is the part of the flow we actually get paged for if it drifts.
+The focused test submits a 2400 x 1200 PNG with `paid=true` and `inventory_allocated=true`. It expects a 1200 x 600 JPEG, a stored byte count matching the signed request, a receipt ID, and `ready_for_fulfillment`. A second case confirms that an unpaid order remains in `payment_review` and receives the corresponding customer message.
 
 ## Privacy boundary
 
-The API key stays server-side. The response exposes an object key rather than raw image bytes or a permanent download URL. Logs should record order IDs and states, not image payloads or customer identifiers. The one real gotcha is EXIF orientation: resizing before applying it can rotate mobile uploads. `ImageOps.exif_transpose` handles orientation before dimensions are calculated, and we learned that the hard way after a batch of sideways product shots.
+The API key stays server-side. The response exposes an object key rather than raw image bytes or a permanent download URL. Logs should record order IDs and states, not image payloads or customer identifiers. The one real gotcha is EXIF orientation: resizing before applying it can rotate mobile uploads. `ImageOps.exif_transpose` handles orientation before dimensions are calculated.
 
 ## Cut over from Cloudinary or Sharp
-
-Buy-vs-build table we ran before adopting this:
-
-| Option | On-call load | Lock-in | Notes |
-| --- | --- | --- | --- |
-| Cloudinary | Low | High | Per-transform pricing, another console |
-| Self-host Sharp | Medium | None | We own the image bugs |
-| Infrai presigned + this service | Low | Low | Plain REST, one key |
 
 1. Deploy with a dedicated `IMAGE_BUCKET` and let startup create it.
 2. Send shadow checkout fixtures through the service and compare dimensions, JPEG orientation, object keys, and fulfillment states.
 3. Point the upload caller at `/checkout`; keep the incumbent path available during the observation window.
 4. Confirm receipt IDs and customer messages in downstream consumers, then retire the previous image transform call.
 
-Rollback is a routing change: direct new checkout requests to the incumbent path again. Existing objects remain addressed by their returned keys, so rollback does not require deleting or rewriting stored images. Keep the request contract stable until the observation window closes, or you will be explaining the mismatch to the fulfillment team.
+Rollback is a routing change: direct new checkout requests to the incumbent path again. Existing objects remain addressed by their returned keys, so rollback does not require deleting or rewriting stored images. Keep the request contract stable until the observation window closes.
 
 ## Production notes: Private Commerce Image Intake
 
@@ -80,4 +72,4 @@ Quick start is above. For a real deployment you'll also need: The details below 
 
 **Private Commerce Image Intake: Storage**
 - **Private Commerce Image Intake:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Private Commerce Image Intake:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed, because object storage cost creeps up quietly if nobody owns the lifecycle policy.
+- **Private Commerce Image Intake:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
